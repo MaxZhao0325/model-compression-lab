@@ -1,58 +1,85 @@
 #!/usr/bin/env python
-# INT8 PTQ for ResNet-50 (CPU) and log metrics
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import argparse, torch, torchvision as tv
-from torch.ao.quantization import get_default_qconfig, prepare, convert
+from torch.ao.quantization import get_default_qconfig, prepare, convert, fuse_modules
 from torch.utils.data import DataLoader
-from mc_utils.measure import model_size_mb, benchmark, log_row
+from torchvision import transforms
+from mc_utils.measure import (model_size_mb, benchmark,
+                              accuracy_classification, log_row)
+from tqdm.auto import tqdm
 
-def get_val_loader(root: str, batch_size: int = 32):
-    weights = tv.models.ResNet50_Weights.IMAGENET1K_V2
-    ds = tv.datasets.ImageNet(root=root, split="val", transform=weights.transforms())
-    return DataLoader(ds, batch_size=batch_size, num_workers=8), len(ds), weights
+def fuse_resnet_manual(model):
+    # fuse the very first stem
+    fuse_modules(model, [["conv1", "bn1", "relu"]], inplace=True)
 
-@torch.inference_mode()
-def accuracy(model, loader, total):
+    # fuse each residual block’s conv/BN/ReLU
+    for layer_name in ["layer1", "layer2", "layer3", "layer4"]:
+        layer = getattr(model, layer_name)
+        for block_name, block in layer.named_children():
+            # in each BasicBlock: conv1+bn1+relu, and conv2+bn2
+            fuse_modules(block, 
+                         [["conv1", "bn1", "relu"], ["conv2", "bn2"]], 
+                         inplace=True)
+    return model
+
+def cifar100_loader(batch_size=64):
+    tfm = transforms.Compose([
+        transforms.Resize(224),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485,0.456,0.406],
+                             std=[0.229,0.224,0.225]),
+    ])
+    ds = tv.datasets.CIFAR100(root="data", train=False,
+                              download=True, transform=tfm)
+    return DataLoader(ds, batch_size=batch_size, num_workers=8)
+
+def main():
+    calib_bs = 32
+    calib_batches = 16      # 16×32 = 512 images
+    val_loader = cifar100_loader(batch_size=128)
+    calib_loader = cifar100_loader(batch_size=calib_bs)
+
+    # load + fuse
+    model = tv.models.resnet50(weights=tv.models.ResNet50_Weights.IMAGENET1K_V2)
     model.eval()
-    correct = 0
-    for x, y in loader:
-        preds = model(x).argmax(-1)
-        correct += (preds == y).sum().item()
-    return round(100 * correct / total, 2)
+    model = fuse_resnet_manual(model)
 
-def main(args):
-    val_loader, n_items, _ = get_val_loader(args.data_dir)
-    calib_loader = DataLoader(val_loader.dataset, batch_size=32, shuffle=True)
+    engine = 'qnnpack' if 'qnnpack' in torch.backends.quantized.supported_engines else 'fbgemm'
+    torch.backends.quantized.engine = engine
+    model.qconfig = get_default_qconfig(engine)
 
-    # ---- load & fuse ----
-    model = tv.models.quantization.resnet50(weights="DEFAULT")
-    model.eval()
-
-    # ---- prepare ----
-    model.qconfig = get_default_qconfig("fbgemm")
     model_prepared = prepare(model, inplace=False)
 
-    # ---- calibration (≈512 images) ----
+    # calibration with tqdm
     with torch.inference_mode():
-        for i, (x, _) in enumerate(calib_loader):
+        for i, (x, _) in tqdm(enumerate(calib_loader),
+                              total=calib_batches, desc="Calibrate"):
             model_prepared(x)
-            if (i + 1) * calib_loader.batch_size >= 512:
+            if i + 1 == calib_batches:
                 break
 
-    # ---- convert to int8 ----
     model_int8 = convert(model_prepared)
 
-    # ---- metrics ----
-    top1 = accuracy(model_int8, val_loader, n_items)
-    lat  = benchmark(model_int8, val_loader, device="cpu")
+    acc = accuracy_classification(model_int8, val_loader, device="cpu")
+    lat = benchmark(model_int8, val_loader, device="cpu")
     size = model_size_mb(model_int8)
-    params_m = round(sum(p.numel() for p in model_int8.parameters()) / 1e6, 2)
+    params = round(sum(p.numel() for p in model_int8.parameters())/1e6, 2)
+
+    note = (
+        f"CIFAR-100 static quantization, "
+        f"{calib_bs}bs×{calib_batches}batches (≈{calib_bs * calib_batches} images) for calibration, "
+        f"engine={engine.upper()}, "
+        f"eval=CPU"
+    )
 
     log_row("results/metrics.csv",
             model="resnet50", technique="int8-PTQ",
-            size_MB=size, params_M=params_m, latency_ms=lat,
-            accuracy=top1, note="static qconfig=fbgemm, CPU")
+            size_MB=size, params_M=params, latency_ms=lat,
+            accuracy=acc, note=note)
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", default="data/imagenet")
-    main(ap.parse_args())
+    main()
