@@ -115,11 +115,15 @@ def main():
         loss = criterion(outputs, y_train)
         loss.backward()
         optimizer.step()
+        print(f"{loss.item():.3f}")
     
     # Back to eval mode
     model.eval()
 
     val_loader = cifar100_loader(batch_size=args.batch)
+
+    # recalibrate batch norm will increase the acc if we do not retrain model
+    # recalibrate_bn(model, train_loader, num_batches=32, device=device)
 
     x0, y0 = next(iter(val_loader))
     preds0 = model(x0.to(device)).argmax(-1).cpu()
@@ -137,7 +141,7 @@ def main():
             technique=f"prune-struct-{args.sparsity}",
             size_MB=size, params_M=params,
             latency_ms=lat, accuracy=acc,
-            note="CIFAR-100 structured L1 + head-FT")
+            note="CIFAR-100 structured L1 + head-FT + retraining")
 
 if __name__ == "__main__":
     main()

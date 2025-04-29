@@ -18,5 +18,5 @@ def plot(sub, title, ylabel):
     plt.ylabel(ylabel)
     plt.title(title); plt.grid(True); plt.show()
 
-plot(df[df.model=="resnet50"], "ResNet-50 Compression", "Top-1 accuracy (%)")
+plot(df[df.model.isin(["resnet50", "resnet18", "mobilenet_v2"])], "ResNet Compression", "Top-1 accuracy (%)")
 plot(df[df.model=="bert-base"], "BERT-base Compression", "SST-2 accuracy (%)")
